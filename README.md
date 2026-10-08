@@ -6,6 +6,7 @@ Play: https://a3vong.github.io/nav-racer/
 
 - Solo: best times are kept per scan and tolerance level in your browser.
 - Battle a friend: click **Battle a friend**, share the link or code. You both race for the same targets; the first to lock one captures it. Most captures out of 10 wins, a tie goes to sudden death. The scan goes browser to browser over WebRTC ([PeerJS](https://peerjs.com/)); it is never uploaded anywhere.
-- Music speeds up with every target. `M` mutes.
+- Music climbs a semitone and speeds up a little with every target. `M` mutes.
+- In a battle you see your opponent's laser: where their camera is and where they're aiming.
 
 Everything lives in `index.html` (three.js, three-mesh-bvh and PeerJS from jsDelivr).

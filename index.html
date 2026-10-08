@@ -988,9 +988,8 @@ const audio = {
 };
 
 // ---------------------------------------------------------------- music
-// A tiny chiptune sequencer: a four-bar A-minor loop that gets faster with every target,
-// adds layers as the race goes on, jumps up a key for the final stretch and goes all out
-// in sudden death. Notes are scheduled slightly ahead on the audio clock so tempo stays tight.
+// A tiny chiptune sequencer: a four-bar A-minor loop that climbs a semitone and gets a bit
+// faster with every target, adds layers as the race goes on and peaks in sudden death. Notes are scheduled slightly ahead on the audio clock so tempo stays tight.
 const MELODY = [
   [69, 0, 72, 0, 76, 0, 74, 72, 69, 0, 67, 0, 69, 0, 0, 0],
   [65, 0, 69, 0, 72, 0, 70, 69, 65, 0, 64, 0, 65, 0, 0, 0],
@@ -1003,7 +1002,7 @@ const VOLUME = 0.45;
 const midi = (n) => 440 * Math.pow(2, (n - 69) / 12);
 
 const music = {
-  playing: false, step: 0, nextAt: 0, timer: null, out: null, noise: null,
+  playing: false, step: 0, nextAt: 0, timer: null, out: null, noise: null, key: 0,
 
   start() {
     if (this.playing) return;
@@ -1021,6 +1020,7 @@ const music = {
     this.out.gain.setValueAtTime(audio.muted ? 0 : VOLUME, ctx.currentTime);
     this.playing = true;
     this.step = 0;
+    this.key = 0;
     this.nextAt = ctx.currentTime + 0.05;
     this.timer = setInterval(() => this.schedule(), 25);
   },
@@ -1036,7 +1036,10 @@ const music = {
     if (this.out && this.playing) this.out.gain.setTargetAtTime(audio.muted ? 0 : VOLUME, audio.ctx.currentTime, 0.02);
   },
 
-  bpm() { return race.sudden ? 240 : 138 + Math.min(race.idx, POINTS) * 9; },
+  bpm() { return race.sudden ? 176 : 132 + Math.min(race.idx, POINTS) * 4; },
+
+  // semitones above A minor; the next target's key only kicks in on the next bar line
+  targetKey() { return race.sudden ? 12 : Math.min(race.idx, POINTS); },
 
   schedule() {
     const now = audio.ctx.currentTime;
@@ -1051,7 +1054,8 @@ const music = {
   play(step, t) {
     const idx = race.idx, sudden = race.sudden;
     const s = step % 16, bar = Math.floor(step / 16) % 4;
-    const shift = sudden ? 5 : idx >= 8 ? 2 : 0;
+    if (s === 0) this.key = this.targetKey();
+    const shift = this.key;
     const len = 60 / this.bpm() / 4;
     const root = BASS[bar] + shift;
 
@@ -1066,7 +1070,7 @@ const music = {
       this.voice(midi(root + 12 + n), t, len * 0.9, 'square', 0.028, 3200);
     }
     const m = MELODY[bar][s];
-    if (m && (idx >= 4 || sudden)) this.voice(midi(m + shift + (idx >= 9 || sudden ? 12 : 0)), t, len * 1.9, 'sawtooth', 0.045, 2600);
+    if (m && (idx >= 4 || sudden)) this.voice(midi(m + shift), t, len * 1.9, 'sawtooth', 0.045, 2600);
   },
 
   voice(freq, t, dur, type, gain, cutoff) {
@@ -1720,7 +1724,7 @@ function leaveBattle(keepState) {
   try { conn?.close(); } catch {}
   try { peer?.destroy(); } catch {}
   if (new URLSearchParams(location.search).has('join')) history.replaceState(null, '', location.pathname);
-  ghost.visible = false;
+  ghost.visible = laser.group.visible = false;
   $('#ghostLabel').style.opacity = '0';
   document.body.classList.remove('battle');
   if (!keepState) toMenu();
@@ -1858,16 +1862,55 @@ ghost.visible = false;
 scene.add(ghost);
 const ghostHit = { pos: new THREE.Vector3(), dir: new THREE.Vector3(), q: new THREE.Quaternion() };
 
+// The opponent's laser: a beam from their camera to where their center dot lands, plus a
+// small cone at their camera so you can see where they are and which way they're looking.
+const BLUE = new THREE.Color('#2196f3');
+const laserMat = (opacity, depthTest) => new THREE.MeshBasicMaterial({
+  color: BLUE, transparent: true, opacity, depthTest, depthWrite: false, toneMapped: false,
+});
+const beamGeom = new THREE.CylinderGeometry(1, 1, 1, 12, 1, true).rotateX(Math.PI / 2).translate(0, 0, 0.5);
+const laser = {
+  group: new THREE.Group(),
+  core: new THREE.Mesh(beamGeom, laserMat(0.95, true)),
+  glow: new THREE.Mesh(beamGeom, laserMat(0.16, false)),
+  eye: new THREE.Mesh(new THREE.ConeGeometry(1, 2.2, 20).rotateX(Math.PI / 2), laserMat(0.85, true)),
+  pos: new THREE.Vector3(), dir: new THREE.Vector3(), q: new THREE.Quaternion(),
+};
+laser.core.renderOrder = 25;
+laser.glow.renderOrder = 26;
+laser.group.add(laser.core, laser.glow, laser.eye);
+laser.group.visible = false;
+scene.add(laser.group);
+
+function updateLaser(o, hit) {
+  const fresh = !laser.group.visible;
+  laser.pos.lerp(ghostHit.pos, fresh ? 1 : 0.4);
+  laser.dir.lerp(ghostHit.dir, fresh ? 1 : 0.4).normalize();
+  const end = hit ? ghost.position : tmpV.copy(laser.pos).addScaledVector(laser.dir, model.diag * 1.5);
+  const len = Math.max(laser.pos.distanceTo(end), 1e-3);
+  laser.group.position.copy(laser.pos);
+  laser.group.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tmpV.copy(end).sub(laser.pos).normalize());
+  const r = model.diag * 0.0016;
+  laser.core.scale.set(r, r, len);
+  laser.glow.scale.set(r * 4, r * 4, len);
+  laser.eye.scale.setScalar(Math.min(model.diag * 0.012, camera.position.distanceTo(laser.pos) * 0.02));
+  const color = (o.hold > 0.05 ? ORANGE : BLUE);
+  for (const m of [laser.core, laser.glow, laser.eye, ghost]) m.material.color.copy(color);
+  laser.group.visible = true;
+}
+
 function updateGhost() {
   const o = net.opp, label = $('#ghostLabel');
   const show = race.battle && battleOn() && o?.cam && !o.left && (state === 'race' || state === 'countdown');
-  const hit = show && castFirst(
+  const hit = !!show && castFirst(
     ghostHit.pos.fromArray(o.cam, 0),
     ghostHit.dir.set(0, 0, -1).applyQuaternion(ghostHit.q.fromArray(o.cam, 3))
   );
-  if (!hit) { ghost.visible = false; label.style.opacity = '0'; return; }
-  ghost.position.lerp(hit.point, ghost.visible ? 0.4 : 1);
-  ghost.visible = true;
+  if (!show) { ghost.visible = laser.group.visible = false; label.style.opacity = '0'; return; }
+  if (hit) ghost.position.lerp(hit.point, ghost.visible ? 0.4 : 1);
+  updateLaser(o, hit);
+  ghost.visible = !!hit;
+  if (!hit) { label.style.opacity = '0'; return; }
   ghost.scale.setScalar(camera.position.distanceTo(ghost.position) * 0.007);
   const ndc = tmpV.copy(ghost.position).project(camera);
   if (ndc.z > 1) { label.style.opacity = '0'; return; }
