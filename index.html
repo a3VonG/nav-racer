@@ -257,6 +257,16 @@
   body.battle .solo-hint { display: none; }
   .pop.opp { color: var(--blue); }
   .ghost-label.locking { background: var(--orange); }
+  .diag { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .dchip { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--navy-3); background: #f6f9fc; border-radius: 999px; padding: 4px 10px; }
+  .dchip i { width: 7px; height: 7px; border-radius: 50%; background: #c7d2de; }
+  .dchip.ok { color: var(--mint-dark); }
+  .dchip.ok i { background: var(--mint); }
+  .dchip.pending i { background: var(--orange); animation: blink 1s ease-in-out infinite; }
+  .dchip.bad { color: #c1271f; }
+  .dchip.bad i { background: #e23a2d; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .diag-hint { font-size: 12.5px; line-height: 1.45; color: #8a4500; background: #fff3e6; border-radius: 10px; padding: 9px 12px; margin: 10px 0 0; }
   .rule { font-size: 12.5px; color: var(--navy-2); background: #f6f9fc; border-radius: 10px; padding: 9px 12px; margin: 12px 0 0; }
   .ghost-label {
     position: absolute; left: 0; top: 0; font-size: 11px; font-weight: 500; color: #fff; background: var(--blue);
@@ -496,6 +506,12 @@
         <span class="pill" id="oppSt"></span>
       </div>
     </div>
+    <div class="diag" aria-live="polite">
+      <span class="dchip" id="dServer"><i></i><span>Battle server</span></span>
+      <span class="dchip" id="dPeer"><i></i><span>Opponent</span></span>
+      <span class="dchip" id="dLink"><i></i><span>Link</span></span>
+    </div>
+    <p class="diag-hint" id="diagHint" hidden>You found each other, but one of your networks won’t let the browsers link up. Try a phone hotspot or another Wi-Fi on one side, then join again. Office, guest and hotel Wi-Fi often block this.</p>
     <p class="rule">Same targets for both of you. First to lock a target captures it. Most captures out of 10 wins; a tie goes to sudden death.</p>
     <div class="row">
       <span class="label">Tolerance</span>
@@ -1236,6 +1252,7 @@ function frame() {
     if (race.battle && net.role === 'host' && !race.claimed && now - race.splitAt > VOID_MS) hostResolve(race.idx, 'void');
   }
   if (state === 'race') music.start(); else music.stop();
+  if (state === 'lobby' && now - net.lobbyTick > 500) { net.lobbyTick = now; lobbyWatch(); }
   updateGhost();
   renderer.render(scene, camera);
 }
@@ -1418,7 +1435,7 @@ const PEER_PREFIX = 'relu-navracer-';
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const CHUNK = 64 * 1024;
 const MAX_SCAN = 200 * 1024 * 1024;
-const net = { peer: null, conn: null, role: null, code: null, ready: false, opp: null, incoming: null, gotModel: false, lastSent: 0, retry: null, hb: null, heardAt: 0, tickAt: 0, rtt: 0, tries: 0 };
+const net = { peer: null, conn: null, role: null, code: null, ready: false, opp: null, incoming: null, gotModel: false, lastSent: 0, retry: null, hb: null, heardAt: 0, tickAt: 0, rtt: 0, tries: 0, dial: null, redials: 0, connAt: 0, route: null, lobbyTick: 0 };
 const HEARTBEAT_MS = 1000, SILENCE_MS = 15000, VOID_MS = 45000, JOIN_TRIES = 12;
 const openedConns = new WeakSet();
 const me = { name: cleanName(store.get('navracer:name')) };
@@ -1486,11 +1503,11 @@ function joinBattle(raw) {
   if (!peerAvailable()) return;
   if (state === 'race' || state === 'countdown') return;
   leaveBattle(true);
-  Object.assign(net, { role: 'guest', code, ready: false, opp: newOpp(), gotModel: false, tries: 0 });
+  Object.assign(net, { role: 'guest', code, ready: false, opp: newOpp(), gotModel: false, tries: 0, redials: 0 });
   net.opp.hasModel = true;
   openLobby();
   const peer = (net.peer = new Peer());
-  const dial = () => attach(peer.connect(PEER_PREFIX + code.toLowerCase(), { reliable: true, serialization: 'binary' }));
+  const dial = (net.dial = () => attach(peer.connect(PEER_PREFIX + code.toLowerCase(), { reliable: true, serialization: 'binary' })));
   peer.on('open', () => {
     if (!net.ready) { net.ready = true; dial(); }
     renderLobby();
@@ -1534,10 +1551,13 @@ function keepAlive(peer) {
 
 function attach(c) {
   net.conn = c;
+  net.connAt = performance.now();
+  net.route = null;
   c.on('open', () => {
     if (net.role === 'host') net.opp = newOpp();
     // PeerJS doesn't always fire 'close' when the WebRTC link dies, so watch for silence.
     openedConns.add(c);
+    linkRoute(c).then((r) => { if (net.conn === c) { net.route = r; renderLobby(); } });
     net.heardAt = net.tickAt = performance.now();
     clearInterval(net.hb);
     net.hb = setInterval(() => {
@@ -1720,7 +1740,7 @@ function leaveBattle(keepState) {
   const { peer, conn } = net;
   clearTimeout(net.retry);
   clearInterval(net.hb);
-  Object.assign(net, { peer: null, conn: null, role: null, code: null, ready: false, opp: null, incoming: null, gotModel: false, retry: null });
+  Object.assign(net, { peer: null, conn: null, role: null, code: null, ready: false, opp: null, incoming: null, gotModel: false, retry: null, dial: null, redials: 0, route: null });
   try { conn?.close(); } catch {}
   try { peer?.destroy(); } catch {}
   if (new URLSearchParams(location.search).has('join')) history.replaceState(null, '', location.pathname);
@@ -1758,7 +1778,7 @@ function renderLobby() {
   const row = $('#oppRow'), oppSt = $('#oppSt');
   row.classList.toggle('empty', !live);
   $('#oppAv').textContent = live ? initial(o?.name) : '?';
-  $('#oppNm').textContent = live ? oppName() : host ? 'Waiting for your opponent…' : 'Connecting…';
+  $('#oppNm').textContent = live ? oppName() : host ? (net.conn ? 'Opponent is connecting…' : 'Waiting for your opponent…') : 'Connecting…';
   $('#oppRole').textContent = live ? (host ? 'Guest' : 'Host') : ' ';
   const oppReady = live && !!o?.hasModel;
   oppSt.textContent = !live ? '–' : oppReady ? 'Ready' : `Scan ${o?.progress || 0}%`;
@@ -1774,6 +1794,45 @@ function renderLobby() {
   $('#battleStart').hidden = !host;
   $('#battleStart').disabled = !oppReady;
   $('#waitTxt').hidden = host;
+  renderDiag(host, live);
+}
+
+function renderDiag(host, live) {
+  const peer = net.peer, pc = net.conn?.peerConnection, ice = pc?.iceConnectionState;
+  const chip = (id, st, text) => { const el = $(id); el.className = `dchip ${st}`; el.lastChild.textContent = text; };
+  const serverUp = net.ready && peer && !peer.disconnected;
+  chip('#dServer', serverUp ? 'ok' : 'pending', serverUp ? 'Battle server' : net.ready ? 'Reconnecting to server' : 'Reaching server');
+  // the host hears about a guest when their offer arrives; the guest knows once the host's answer is in
+  const found = live || (host ? !!net.conn : !!pc?.remoteDescription);
+  chip('#dPeer', found ? 'ok' : 'pending', found ? (host ? 'Opponent found' : 'Host found')
+    : host ? 'Waiting for opponent' : net.tries ? `Looking for host (${net.tries})` : 'Looking for host');
+  const failed = ice === 'failed';
+  chip('#dLink', live ? 'ok' : failed ? 'bad' : found ? 'pending' : '', live ? (net.route === 'relay' ? 'Linked via relay' : 'Linked directly')
+    : failed ? 'Link blocked' : found ? 'Linking…' : 'Link');
+  $('#diagHint').hidden = !(!live && found && (failed || performance.now() - net.connAt > 15000));
+}
+
+// Re-dial once or twice when the direct link fails (guest side), and keep the status fresh.
+function lobbyWatch() {
+  const ice = net.conn?.peerConnection?.iceConnectionState;
+  if (net.role === 'guest' && !connected() && ice === 'failed' && net.redials < 2 && net.dial) {
+    net.redials++;
+    try { net.conn.close(); } catch {}
+    net.dial();
+  }
+  renderLobby();
+}
+
+async function linkRoute(c) {
+  try {
+    const stats = await c.peerConnection.getStats();
+    let pair = null;
+    stats.forEach((r) => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId); });
+    if (!pair) stats.forEach((r) => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+    if (!pair) return null;
+    const types = [stats.get(pair.localCandidateId)?.candidateType, stats.get(pair.remoteCandidateId)?.candidateType];
+    return types.includes('relay') ? 'relay' : 'direct';
+  } catch { return null; }
 }
 
 function renderOpp() {
